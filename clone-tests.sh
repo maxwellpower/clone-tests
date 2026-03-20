@@ -121,11 +121,85 @@ run_network_diag() {
         if [ -n "$GITHUB_RDNS" ]; then
             log_message "Reverse DNS: $GITHUB_IP -> $GITHUB_RDNS"
             # Extract POP code from rDNS (e.g. lb-140-82-112-4-sea.github.com -> SEA)
-            GITHUB_POP=$(echo "$GITHUB_RDNS" | grep -oE '-[a-z]{3}\.' | tr -d '-.' | tr '[:lower:]' '[:upper:]')
+            GITHUB_POP=$(echo "$GITHUB_RDNS" | sed 's/.*-\([a-z][a-z][a-z]\)\..*/\1/' | tr '[:lower:]' '[:upper:]')
             [ -n "$GITHUB_POP" ] && log_message "GitHub POP: $GITHUB_POP"
         fi
     fi
     [ -z "$GITHUB_POP" ] && GITHUB_POP="unknown"
+
+    # DNS resolver analysis - critical for GeoIP routing investigation
+    # GitHub uses Route53/NS1 which route based on the *resolver's* IP, not the client's
+    # If the resolver is in the wrong region, traffic gets sent to the wrong POP
+    DNS_RESOLVER=""
+    DNS_AUTH_NS=""
+    DNS_RESOLVER_RDNS=""
+    if command -v dig &>/dev/null; then
+        # What DNS resolver is this machine using? (the IP that Route53/NS1 sees)
+        DNS_RESOLVER=$(dig +short whoami.akamai.net @ns1-1.akamaitech.net 2>/dev/null | head -1)
+        [ -z "$DNS_RESOLVER" ] && DNS_RESOLVER=$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null | head -1)
+        if [ -n "$DNS_RESOLVER" ]; then
+            DNS_RESOLVER_RDNS=$(host "$DNS_RESOLVER" 2>/dev/null | awk '/domain name pointer/ {print $NF}' | head -1)
+            log_message "DNS resolver outbound IP: $DNS_RESOLVER${DNS_RESOLVER_RDNS:+ ($DNS_RESOLVER_RDNS)}"
+        fi
+
+        # Which authoritative nameserver answered for github.com? (Route53 vs NS1)
+        DNS_AUTH_NS=$(dig +noall +authority github.com 2>/dev/null | awk '{print $5}' | head -1)
+        [ -n "$DNS_AUTH_NS" ] && log_message "Authoritative NS: $DNS_AUTH_NS"
+
+        # What do Route53 vs NS1 each return? (they may disagree on POP)
+        local ns1_ip r53_ip ns1_pop r53_pop
+        ns1_ip=$(dig +short github.com @dns1.p08.nsone.net 2>/dev/null | head -1)
+        r53_ip=$(dig +short github.com @ns-1707.awsdns-21.co.uk 2>/dev/null | head -1)
+        if [ -n "$ns1_ip" ]; then
+            ns1_pop=$(host "$ns1_ip" 2>/dev/null | awk '/domain name pointer/ {print $NF}' | head -1 | sed 's/.*-\([a-z][a-z][a-z]\)\..*/\1/' | tr '[:lower:]' '[:upper:]')
+            log_message "NS1 returns: $ns1_ip (POP: ${ns1_pop:-?})"
+        fi
+        if [ -n "$r53_ip" ]; then
+            r53_pop=$(host "$r53_ip" 2>/dev/null | awk '/domain name pointer/ {print $NF}' | head -1 | sed 's/.*-\([a-z][a-z][a-z]\)\..*/\1/' | tr '[:lower:]' '[:upper:]')
+            log_message "Route53 returns: $r53_ip (POP: ${r53_pop:-?})"
+        fi
+        # Flag if NS1 and Route53 disagree on POP routing
+        if [ -n "$ns1_pop" ] && [ -n "$r53_pop" ] && [ "$ns1_pop" != "$r53_pop" ]; then
+            log_message "WARNING: NS1 ($ns1_pop) and Route53 ($r53_pop) disagree on POP!"
+        fi
+    else
+        log_message "DNS resolver analysis: dig not available"
+    fi
+
+    # Configured nameservers on this system
+    local sys_resolvers
+    if [ -f /etc/resolv.conf ]; then
+        sys_resolvers=$(awk '/^nameserver/ {printf "%s ", $2}' /etc/resolv.conf)
+    fi
+    if [[ "$(uname)" == "Darwin" ]]; then
+        sys_resolvers="${sys_resolvers}$(scutil --dns 2>/dev/null | awk '/nameserver\[/ {printf "%s ", $3}' | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+    fi
+    [ -n "$sys_resolvers" ] && log_message "System resolvers: $sys_resolvers"
+
+    # Per-AZ latency comparison - test TCP handshake to each known github.com subnet
+    # This directly measures the cost of being routed to a far-away AZ
+    log_message "AZ latency comparison (TCP handshake to github.com IPs):"
+    local az_ips="140.82.112.3 140.82.113.3 140.82.114.3"
+    # Also test the IP we actually resolved to, in case it's a different subnet
+    if [[ "$GITHUB_IP" != "unresolved" ]] && ! echo "$az_ips" | grep -q "$GITHUB_IP"; then
+        az_ips="$az_ips $GITHUB_IP"
+    fi
+    AZ_LATENCY_SUMMARY=""
+    for az_ip in $az_ips; do
+        local az_tcp_time az_pop_name
+        az_tcp_time=$(curl -w '%{time_connect}' -o /dev/null -s --max-time 5 \
+            --resolve "github.com:443:$az_ip" https://github.com 2>/dev/null) || az_tcp_time=""
+        if [ -n "$az_tcp_time" ]; then
+            local az_tcp_ms
+            az_tcp_ms=$(awk "BEGIN {printf \"%.0f\", $az_tcp_time * 1000}")
+            az_pop_name=$(host "$az_ip" 2>/dev/null | awk '/domain name pointer/ {print $NF}' | head -1 | sed 's/.*-\([a-z][a-z][a-z]\)\..*/\1/' | tr '[:lower:]' '[:upper:]')
+            log_message "  $az_ip (${az_pop_name:-?}): TCP=${az_tcp_ms}ms"
+            AZ_LATENCY_SUMMARY="${AZ_LATENCY_SUMMARY}${az_pop_name:-?}@${az_ip}=${az_tcp_ms}ms "
+        else
+            log_message "  $az_ip: unreachable"
+            AZ_LATENCY_SUMMARY="${AZ_LATENCY_SUMMARY}?@${az_ip}=timeout "
+        fi
+    done
 
     # HTTPS connection timing via curl (DNS, TCP handshake, TLS handshake, time-to-first-byte)
     local curl_out
@@ -168,7 +242,7 @@ run_network_diag() {
     fi
 
     # Append to network diagnostics log
-    echo "Clone #$CLONE_NUM | $(date '+%Y-%m-%d %H:%M:%S') | IP=$GITHUB_IP | POP=$GITHUB_POP | $DIAG_SUMMARY | Ping=${PING_AVG:-N/A}ms Loss=${PING_LOSS:-N/A} | rDNS=${GITHUB_RDNS:-N/A}" >> "$NETWORK_LOG"
+    echo "Clone #$CLONE_NUM | $(date '+%Y-%m-%d %H:%M:%S') | IP=$GITHUB_IP | POP=$GITHUB_POP | Resolver=${DNS_RESOLVER:-N/A} | AuthNS=${DNS_AUTH_NS:-N/A} | AZ_Latency: ${AZ_LATENCY_SUMMARY:-N/A}| $DIAG_SUMMARY | Ping=${PING_AVG:-N/A}ms Loss=${PING_LOSS:-N/A} | rDNS=${GITHUB_RDNS:-N/A}" >> "$NETWORK_LOG"
 
     # Traceroute - capture the path to github.com (key evidence for routing issues)
     log_message "Running traceroute to github.com (15s max)..."
