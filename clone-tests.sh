@@ -20,9 +20,9 @@ while [[ $# -gt 0 ]]; do
 done
 # Configuration - use script's directory for portability across environments
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# Default repo: chromium/chromium (~20 GB full clone) - large enough for sustained speed measurement
-# Override with --repo <url> for other repos (e.g. --repo https://github.com/torvalds/linux)
-REPO_URL="${CLONE_REPO:-https://github.com/chromium/chromium}"
+# Default repo: torvalds/linux (~4.5 GB full clone) - large enough for sustained speed measurement
+# Override with --repo <url> for other repos (e.g. --repo https://github.com/chromium/chromium)
+REPO_URL="${CLONE_REPO:-https://github.com/torvalds/linux}"
 # Generate a unique run ID: timestamp + 4-char random suffix
 RUN_ID="$(date '+%Y%m%d-%H%M%S')-$(head -c 256 /dev/urandom | LC_ALL=C tr -dc 'a-z0-9' | head -c 4)"
 TEST_DIR="$SCRIPT_DIR/logs/$RUN_ID"
@@ -378,16 +378,17 @@ HEARTBEAT_PID=$!
 SPEEDS_HEARTBEAT_PID=$!
 # Use PTY so git outputs progress (git buffers when piped). script writes typescript to file - use /dev/stdout to capture
 run_git() {
+    # Large repos need bigger POST buffer to avoid HTTP 400 on ref negotiation
     if command -v stdbuf &>/dev/null; then
-        stdbuf -oL git clone --progress "$REPO_URL" "$CLONE_DIR" 2>&1
+        stdbuf -oL git -c http.postBuffer=524288000 clone --progress "$REPO_URL" "$CLONE_DIR" 2>&1
     elif command -v script &>/dev/null; then
         if [[ "$(uname)" == "Darwin" ]]; then
-            script -q /dev/stdout git clone --progress "$REPO_URL" "$CLONE_DIR" 2>&1
+            script -q /dev/stdout git -c http.postBuffer=524288000 clone --progress "$REPO_URL" "$CLONE_DIR" 2>&1
         else
-            script -q -F -t 0 /dev/stdout git clone --progress "$REPO_URL" "$CLONE_DIR" 2>&1
+            script -q -F -t 0 /dev/stdout git -c http.postBuffer=524288000 clone --progress "$REPO_URL" "$CLONE_DIR" 2>&1
         fi
     else
-        git clone --progress "$REPO_URL" "$CLONE_DIR" 2>&1
+        git -c http.postBuffer=524288000 clone --progress "$REPO_URL" "$CLONE_DIR" 2>&1
     fi
 }
 # tr '\r' '\n' - git uses \r for progress overwrites; without this, read blocks until clone finishes
