@@ -20,15 +20,16 @@ while [[ $# -gt 0 ]]; do
 done
 # Configuration - use script's directory for portability across environments
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# Default repo: torvalds/linux (~4.5 GB full clone) - large enough for sustained speed measurement
-# Override with --repo <url> for other repos (e.g. --repo https://github.com/BabylonJS/Babylon.js)
-REPO_URL="${CLONE_REPO:-https://github.com/torvalds/linux}"
+# Default repo: chromium/chromium (~20 GB full clone) - large enough for sustained speed measurement
+# Override with --repo <url> for other repos (e.g. --repo https://github.com/torvalds/linux)
+REPO_URL="${CLONE_REPO:-https://github.com/chromium/chromium}"
 TEST_DIR="$SCRIPT_DIR"
 LOG_FILE="$TEST_DIR/clone_test.log"
 SUMMARY_LOG="$TEST_DIR/clone_summary.log"
 SPEEDS_LOG="$TEST_DIR/clone_speeds.csv"
 CLONE_LIVE_LOG="$TEST_DIR/clone_live.log"
 NETWORK_LOG="$TEST_DIR/network_diag.log"
+SPEED_STATS_FILE="$TEST_DIR/.clone_speed_stats"
 CLONE_DIR="$TEST_DIR/framework_clone"
 CLONE_TIMEOUT=300  # 5 minutes - linux kernel needs ~2-5 min depending on connection speed
 SLEEP_BETWEEN_RUNS=0   # No delay - start next clone immediately after cancel
@@ -114,10 +115,17 @@ run_network_diag() {
 
     # Reverse DNS on GitHub IP to identify datacenter/POP
     GITHUB_RDNS=""
+    GITHUB_POP=""
     if [[ "$GITHUB_IP" != "unresolved" ]]; then
         GITHUB_RDNS=$(host "$GITHUB_IP" 2>/dev/null | awk '/domain name pointer/ {print $NF}' | head -1)
-        [ -n "$GITHUB_RDNS" ] && log_message "Reverse DNS: $GITHUB_IP -> $GITHUB_RDNS"
+        if [ -n "$GITHUB_RDNS" ]; then
+            log_message "Reverse DNS: $GITHUB_IP -> $GITHUB_RDNS"
+            # Extract POP code from rDNS (e.g. lb-140-82-112-4-sea.github.com -> SEA)
+            GITHUB_POP=$(echo "$GITHUB_RDNS" | grep -oE '-[a-z]{3}\.' | tr -d '-.' | tr '[:lower:]' '[:upper:]')
+            [ -n "$GITHUB_POP" ] && log_message "GitHub POP: $GITHUB_POP"
+        fi
     fi
+    [ -z "$GITHUB_POP" ] && GITHUB_POP="unknown"
 
     # HTTPS connection timing via curl (DNS, TCP handshake, TLS handshake, time-to-first-byte)
     local curl_out
@@ -160,10 +168,10 @@ run_network_diag() {
     fi
 
     # Append to network diagnostics log
-    echo "Clone #$CLONE_NUM | $(date '+%Y-%m-%d %H:%M:%S') | IP=$GITHUB_IP | $DIAG_SUMMARY | Ping=${PING_AVG:-N/A}ms Loss=${PING_LOSS:-N/A} | rDNS=${GITHUB_RDNS:-N/A}" >> "$NETWORK_LOG"
+    echo "Clone #$CLONE_NUM | $(date '+%Y-%m-%d %H:%M:%S') | IP=$GITHUB_IP | POP=$GITHUB_POP | $DIAG_SUMMARY | Ping=${PING_AVG:-N/A}ms Loss=${PING_LOSS:-N/A} | rDNS=${GITHUB_RDNS:-N/A}" >> "$NETWORK_LOG"
 
     # Traceroute - capture the path to github.com (key evidence for routing issues)
-    log_message "Running traceroute to github.com..."
+    log_message "Running traceroute to github.com (15s max)..."
     local traceroute_cmd
     if command -v traceroute &>/dev/null; then
         traceroute_cmd="traceroute"
@@ -172,7 +180,15 @@ run_network_diag() {
     fi
     if [[ -n "$traceroute_cmd" ]]; then
         local trace_out
-        trace_out=$($traceroute_cmd -m 20 github.com 2>&1) || true
+        # Hard 15s timeout - traceroute can hang for minutes on unresponsive hops
+        if command -v timeout &>/dev/null; then
+            trace_out=$(timeout 15 $traceroute_cmd -m 20 github.com 2>&1) || true
+        elif command -v gtimeout &>/dev/null; then
+            trace_out=$(gtimeout 15 $traceroute_cmd -m 20 github.com 2>&1) || true
+        else
+            # macOS fallback: use perl alarm as timeout
+            trace_out=$(perl -e 'alarm 15; exec @ARGV' $traceroute_cmd -m 20 github.com 2>&1) || true
+        fi
         local hop_count
         hop_count=$(echo "$trace_out" | grep -cE '^\s*[0-9]+' || echo "0")
         log_message "Traceroute: $hop_count hops to github.com"
@@ -217,7 +233,9 @@ DIAG_SUMMARY=""
 PING_AVG=""
 PING_LOSS=""
 GITHUB_RDNS=""
+GITHUB_POP=""
 rm -rf "$CLONE_DIR"
+rm -f "$SPEED_STATS_FILE"
 log_message "==========================================="
 log_message "Clone Test Started (READ-ONLY)"
 [ -n "$CLONE_ENV" ] && log_message "Environment: $CLONE_ENV"
@@ -256,8 +274,8 @@ log_message "Clone directory: $CLONE_DIR"
 # Captures download speed for network performance monitoring
 log_message "Running clone for ${CLONE_TIMEOUT}s - will cancel and restart for continuous speed tracking"
 # Create speeds log with header if new file (human-readable for tailing)
-[ ! -f "$SPEEDS_LOG" ] && echo "# Clone # | Env  | Timestamp           | Received  | Speed      | IP" > "$SPEEDS_LOG"
-[ ! -f "$NETWORK_LOG" ] && echo "# Clone # | Timestamp | IP | HTTPS Timing | Ping | rDNS" > "$NETWORK_LOG"
+[ ! -f "$SPEEDS_LOG" ] && echo "# Clone # | Env  | Timestamp           | Received  | Speed      | POP  | IP" > "$SPEEDS_LOG"
+[ ! -f "$NETWORK_LOG" ] && echo "# Clone # | Timestamp | IP | POP | HTTPS Timing | Ping | rDNS" > "$NETWORK_LOG"
 # Live log: every line from git, updated in real-time (tail -f clone_live.log)
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] --- Clone #$CLONE_NUM started${CLONE_ENV:+ (env: $CLONE_ENV)} ---" > "$CLONE_LIVE_LOG"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] (connecting - git may take 1-2 min before first output)..." >> "$CLONE_LIVE_LOG"
@@ -271,7 +289,7 @@ HEARTBEAT_PID=$!
     case $(uname) in Darwin) mtime=$(stat -f %m "$SPEEDS_LOG" 2>/dev/null) ;; *) mtime=$(stat -c %Y "$SPEEDS_LOG" 2>/dev/null) ;; esac
     [ -z "$mtime" ] && continue
     [ $(date +%s) -le $((mtime + 55)) ] && continue  # file updated recently, not stalled
-    echo "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $(date '+%Y-%m-%d %H:%M:%S') | (stalled - no update 60s) | -- | $GITHUB_IP" >> "$SPEEDS_LOG"
+    echo "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $(date '+%Y-%m-%d %H:%M:%S') | (stalled - no update 60s) | -- | ${GITHUB_POP:-?} | $GITHUB_IP" >> "$SPEEDS_LOG"
   done ) &
 SPEEDS_HEARTBEAT_PID=$!
 # Use PTY so git outputs progress (git buffers when piped). script writes typescript to file - use /dev/stdout to capture
@@ -309,23 +327,39 @@ unbuf_tr() {
     echo "$msg" >> "$CLONE_LIVE_LOG"
     # Extract speed samples - git uses MiB/s when fast, KiB/s when slow (e.g. "157.21 MiB | 4.58 MiB/s" or "13.30 MiB | 774.00 KiB/s")
     if [[ "$line" =~ ([0-9]+\.[0-9]+)\ (MiB|GiB)\ \|\ ([0-9]+\.[0-9]+)\ (MiB|KiB)/s ]]; then
-        # Deduplicate - git/tr can produce duplicate lines; only log when values change
-        current="${BASH_REMATCH[1]}|${BASH_REMATCH[3]}|${BASH_REMATCH[4]}"
-        [[ "$current" == "${LAST_SPEED:-}" ]] && continue
-        LAST_SPEED="$current"
-        ts=$(date '+%Y-%m-%d %H:%M:%S')
+        received_val="${BASH_REMATCH[1]}"
+        received_unit="${BASH_REMATCH[2]}"
         speed_val="${BASH_REMATCH[3]}"
         speed_unit="${BASH_REMATCH[4]}"
+        # Normalize received to MiB for monotonic check (detect macOS script buffer replays)
+        if [[ "$received_unit" == "GiB" ]]; then
+            received_mib=$(awk "BEGIN {printf \"%.2f\", $received_val * 1024}")
+        else
+            received_mib="$received_val"
+        fi
+        # Skip if received went backward (macOS script replays entire buffer at end)
+        if [[ -n "$LAST_RECEIVED_MIB" ]]; then
+            is_backward=$(awk "BEGIN {print ($received_mib < $LAST_RECEIVED_MIB) ? 1 : 0}")
+            [[ "$is_backward" == "1" ]] && continue
+        fi
+        # Skip consecutive identical values
+        current="${received_val}|${speed_val}|${speed_unit}"
+        [[ "$current" == "${LAST_SPEED:-}" ]] && continue
+        LAST_SPEED="$current"
+        LAST_RECEIVED_MIB="$received_mib"
+        ts=$(date '+%Y-%m-%d %H:%M:%S')
         # Normalize to MiB/s for consistent CSV (KiB/s / 1024 = MiB/s)
         if [[ "$speed_unit" == "KiB" ]]; then
-            speed_display=$(awk "BEGIN {printf \"%.2f\", $speed_val / 1024}")
-            speed_display="${speed_display} MiB/s"
+            speed_mib=$(awk "BEGIN {printf \"%.2f\", $speed_val / 1024}")
         else
-            speed_display="${speed_val} MiB/s"
+            speed_mib="$speed_val"
         fi
-        line_out="Clone #$CLONE_NUM | ${CLONE_ENV:--} | $ts | ${BASH_REMATCH[1]} ${BASH_REMATCH[2]} received | $speed_display | $GITHUB_IP"
+        speed_display="${speed_mib} MiB/s"
+        line_out="Clone #$CLONE_NUM | ${CLONE_ENV:--} | $ts | ${received_val} ${received_unit} received | $speed_display | ${GITHUB_POP:-?} | $GITHUB_IP"
         echo "$line_out" >> "$SPEEDS_LOG"
         echo "$line_out"
+        # Track min/max/sum/count for per-clone speed stats
+        echo "$speed_mib" >> "$SPEED_STATS_FILE"
     fi
 done ) &
 CLONE_PID=$!
@@ -347,6 +381,19 @@ END_TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 DURATION=$((END_TIME - START_TIME))
 log_message "Clone ended at: $END_TIMESTAMP"
 log_message "Duration: ${DURATION} seconds"
+
+# Calculate per-clone speed stats from samples (min/max/avg)
+SPEED_MIN="" SPEED_MAX="" SPEED_AVG="" SPEED_SAMPLES=0
+if [ -f "$SPEED_STATS_FILE" ] && [ -s "$SPEED_STATS_FILE" ]; then
+    read -r SPEED_MIN SPEED_MAX SPEED_AVG SPEED_SAMPLES <<< $(awk '
+        BEGIN { min=999999; max=0; sum=0; n=0 }
+        { val=$1+0; if(val>0){ if(val<min)min=val; if(val>max)max=val; sum+=val; n++ } }
+        END { if(n>0) printf "%.1f %.1f %.1f %d", min, max, sum/n, n; else print "0 0 0 0" }
+    ' "$SPEED_STATS_FILE")
+    log_message "Speed stats: min=${SPEED_MIN} MiB/s | max=${SPEED_MAX} MiB/s | avg=${SPEED_AVG} MiB/s | samples=${SPEED_SAMPLES}"
+fi
+rm -f "$SPEED_STATS_FILE"
+SPEED_STATS="Min=${SPEED_MIN:-N/A} Max=${SPEED_MAX:-N/A} Avg=${SPEED_AVG:-N/A} MiB/s (${SPEED_SAMPLES:-0} samples)"
 # Timed out if we ran for (nearly) the full timeout duration
 TIMED_OUT=0
 [ $DURATION -ge $((CLONE_TIMEOUT - 2)) ] && [ $EXIT_CODE -ne 0 ] && TIMED_OUT=1
@@ -369,16 +416,16 @@ if [ -d "$CLONE_DIR" ]; then
 fi
 if [ $EXIT_CODE -eq 0 ]; then
     log_message "RESULT: SUCCESS (full clone completed before timeout)"
-    log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | SUCCESS | Duration: ${DURATION}s | Size: ${SIZE:-N/A} | Speed: ${SPEED_MBPS:-N/A} MiB/s | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A}"
+    log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | SUCCESS | Duration: ${DURATION}s | Size: ${SIZE:-N/A} | Avg: ${SPEED_MBPS:-N/A} MiB/s | $SPEED_STATS | POP: ${GITHUB_POP:-?} | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A}"
 elif [ $TIMED_OUT -eq 1 ]; then
-    log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | TIMEOUT | Duration: ${DURATION}s | Size: ${SIZE:-N/A} | Speed: ${SPEED_MBPS:-N/A} MiB/s | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A}"
+    log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | TIMEOUT | Duration: ${DURATION}s | Size: ${SIZE:-N/A} | Avg: ${SPEED_MBPS:-N/A} MiB/s | $SPEED_STATS | POP: ${GITHUB_POP:-?} | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A}"
 elif [ $TIMED_OUT -eq 0 ]; then
     log_message "RESULT: FAILURE"
     log_message "Exit code: $EXIT_CODE"
     ERROR_MSG=$(grep -i "fatal\|error\|timeout" "$LOG_FILE" | tail -1 | sed 's/\[.*\] GIT: //')
     log_message "Error summary from git output:"
     grep -i "error\|fatal\|timeout\|connection\|denied" "$LOG_FILE" | tail -10 | tee -a "$LOG_FILE"
-    log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | FAILURE | Duration: ${DURATION}s | Exit Code: $EXIT_CODE | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A} | Error: $ERROR_MSG"
+    log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | FAILURE | Duration: ${DURATION}s | Exit Code: $EXIT_CODE | POP: ${GITHUB_POP:-?} | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A} | Error: $ERROR_MSG"
 fi
 # ALWAYS cleanup clone directory to save space
 if [ -d "$CLONE_DIR" ]; then

@@ -7,4 +7,5 @@
 *.log.old
 clone_speeds.csv
 clone_test.lock
+.clone_speed_stats
 framework_clone/
