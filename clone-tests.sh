@@ -23,20 +23,26 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Default repo: chromium/chromium (~20 GB full clone) - large enough for sustained speed measurement
 # Override with --repo <url> for other repos (e.g. --repo https://github.com/torvalds/linux)
 REPO_URL="${CLONE_REPO:-https://github.com/chromium/chromium}"
-TEST_DIR="$SCRIPT_DIR"
+# Generate a unique run ID: timestamp + 4-char random suffix
+RUN_ID="$(date '+%Y%m%d-%H%M%S')-$(head -c 256 /dev/urandom | LC_ALL=C tr -dc 'a-z0-9' | head -c 4)"
+TEST_DIR="$SCRIPT_DIR/logs/$RUN_ID"
 LOG_FILE="$TEST_DIR/clone_test.log"
 SUMMARY_LOG="$TEST_DIR/clone_summary.log"
 SPEEDS_LOG="$TEST_DIR/clone_speeds.csv"
 CLONE_LIVE_LOG="$TEST_DIR/clone_live.log"
 NETWORK_LOG="$TEST_DIR/network_diag.log"
 SPEED_STATS_FILE="$TEST_DIR/.clone_speed_stats"
-CLONE_DIR="$TEST_DIR/framework_clone"
+CLONE_DIR="$SCRIPT_DIR/git_clone"
 CLONE_TIMEOUT=300  # 5 minutes - linux kernel needs ~2-5 min depending on connection speed
 SLEEP_BETWEEN_RUNS=0   # No delay - start next clone immediately after cancel
 LOCK_FILE="$SCRIPT_DIR/clone_test.lock"
 MAX_LOG_SIZE_KB=51200  # 50 MB - rotate clone_test.log when it exceeds this
 MIN_DISK_FREE_KB=10485760  # 10 GB - skip clone if disk is below this (need ~5 GB for linux kernel)
 mkdir -p "$TEST_DIR"
+echo "============================================"
+echo "Clone Speed Test - Run ID: $RUN_ID"
+echo "Logs: logs/$RUN_ID/"
+echo "============================================"
 # Prevent multiple instances; clean up orphans from a previous crashed run
 if [ -f "$LOCK_FILE" ]; then
     OLD_PID=$(cat "$LOCK_FILE" 2>/dev/null)
@@ -49,7 +55,7 @@ if [ -f "$LOCK_FILE" ]; then
     fi
 fi
 # Kill any orphaned git clone processes left over from a previous interrupted run
-pkill -f "git clone.*framework_clone" 2>/dev/null
+pkill -f "git clone.*git_clone" 2>/dev/null
 echo $$ > "$LOCK_FILE"
 
 # Function to kill a process tree (process + all descendants)
@@ -181,7 +187,7 @@ run_network_diag() {
 
     # Per-AZ latency comparison - raw TCP handshake to each known github.com subnet
     # Uses curl in TCP-only mode (no TLS) for pure network latency measurement
-    log_message "AZ latency comparison (TCP connect to port 443):"
+    log_message "AZ latency comparison (TCP connect to port 80):"
     local az_ips="140.82.112.3 140.82.113.3 140.82.114.3"
     # Also test the IP we actually resolved to, in case it's a different subnet
     if [[ "$GITHUB_IP" != "unresolved" ]] && ! echo "$az_ips" | grep -q "$GITHUB_IP"; then
@@ -474,7 +480,7 @@ rm -f "$SPEED_STATS_FILE"
 SPEED_STATS="Min=${SPEED_MIN:-N/A} Max=${SPEED_MAX:-N/A} Avg=${SPEED_AVG:-N/A} MiB/s (${SPEED_SAMPLES:-0} samples)"
 # Timed out if we ran for (nearly) the full timeout duration
 TIMED_OUT=0
-[ $DURATION -ge $((CLONE_TIMEOUT - 2)) ] && [ $EXIT_CODE -ne 0 ] && TIMED_OUT=1
+[ $DURATION -ge $((CLONE_TIMEOUT - 2)) ] && TIMED_OUT=1
 if [ -d "$CLONE_DIR" ]; then
     SIZE=$(du -sh "$CLONE_DIR" 2>/dev/null | cut -f1)
     SIZE_KB=$(du -sk "$CLONE_DIR" 2>/dev/null | cut -f1)
@@ -492,12 +498,12 @@ if [ -d "$CLONE_DIR" ]; then
         log_message "RESULT: TIMEOUT (cancelled after ${CLONE_TIMEOUT}s for network monitoring)"
     fi
 fi
-if [ $EXIT_CODE -eq 0 ]; then
+if [ $TIMED_OUT -eq 1 ]; then
+    log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | TIMEOUT | Duration: ${DURATION}s | Size: ${SIZE:-N/A} | $SPEED_STATS | POP: ${GITHUB_POP:-?} | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A}"
+elif [ $EXIT_CODE -eq 0 ]; then
     log_message "RESULT: SUCCESS (full clone completed before timeout)"
     log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | SUCCESS | Duration: ${DURATION}s | Size: ${SIZE:-N/A} | $SPEED_STATS | POP: ${GITHUB_POP:-?} | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A}"
-elif [ $TIMED_OUT -eq 1 ]; then
-    log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | TIMEOUT | Duration: ${DURATION}s | Size: ${SIZE:-N/A} | $SPEED_STATS | POP: ${GITHUB_POP:-?} | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A}"
-elif [ $TIMED_OUT -eq 0 ]; then
+else
     log_message "RESULT: FAILURE"
     log_message "Exit code: $EXIT_CODE"
     ERROR_MSG=$(grep -i "fatal\|error\|timeout" "$LOG_FILE" | tail -1 | sed 's/\[.*\] GIT: //')
@@ -519,7 +525,7 @@ fi
 log_message "Disk space after clone:"
 df -h "$TEST_DIR" | tee -a "$LOG_FILE"
 log_message "Clone test completed"
-log_message "Speed samples: $SPEEDS_LOG | Network diag: $NETWORK_LOG | Live: $CLONE_LIVE_LOG (tail -f)"
+log_message "Logs: logs/$RUN_ID/ | Speeds: clone_speeds.csv | Network: network_diag.log | Live: clone_live.log (tail -f)"
 log_message "==========================================="
 if [ $SLEEP_BETWEEN_RUNS -gt 0 ]; then
     log_message "Next run in ${SLEEP_BETWEEN_RUNS}s..."

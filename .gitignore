@@ -8,4 +8,5 @@
 clone_speeds.csv
 clone_test.lock
 .clone_speed_stats
-framework_clone/
+git_clone/
+logs/
