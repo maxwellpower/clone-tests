@@ -142,9 +142,12 @@ run_network_diag() {
             log_message "DNS resolver outbound IP: $DNS_RESOLVER${DNS_RESOLVER_RDNS:+ ($DNS_RESOLVER_RDNS)}"
         fi
 
-        # Which authoritative nameserver answered for github.com? (Route53 vs NS1)
-        DNS_AUTH_NS=$(dig +noall +authority github.com 2>/dev/null | awk '{print $5}' | head -1)
-        [ -n "$DNS_AUTH_NS" ] && log_message "Authoritative NS: $DNS_AUTH_NS"
+        # Which DNS server actually answered our query? (local resolver, not auth NS)
+        DNS_SERVER=$(dig github.com 2>/dev/null | awk '/^;; SERVER:/ {gsub(/[^0-9.]/, "", $3); print $3}' | head -1)
+        [ -n "$DNS_SERVER" ] && log_message "DNS server used: $DNS_SERVER"
+        # Which authoritative NS providers serve github.com? (should be Route53 + NS1)
+        DNS_AUTH_NS=$(dig NS github.com +short 2>/dev/null | sort | tr '\n' ' ')
+        [ -n "$DNS_AUTH_NS" ] && log_message "Auth nameservers: $DNS_AUTH_NS"
 
         # What do Route53 vs NS1 each return? (they may disagree on POP)
         local ns1_ip r53_ip ns1_pop r53_pop
@@ -176,9 +179,9 @@ run_network_diag() {
     fi
     [ -n "$sys_resolvers" ] && log_message "System resolvers: $sys_resolvers"
 
-    # Per-AZ latency comparison - test TCP handshake to each known github.com subnet
-    # This directly measures the cost of being routed to a far-away AZ
-    log_message "AZ latency comparison (TCP handshake to github.com IPs):"
+    # Per-AZ latency comparison - raw TCP handshake to each known github.com subnet
+    # Uses curl in TCP-only mode (no TLS) for pure network latency measurement
+    log_message "AZ latency comparison (TCP connect to port 443):"
     local az_ips="140.82.112.3 140.82.113.3 140.82.114.3"
     # Also test the IP we actually resolved to, in case it's a different subnet
     if [[ "$GITHUB_IP" != "unresolved" ]] && ! echo "$az_ips" | grep -q "$GITHUB_IP"; then
@@ -187,8 +190,9 @@ run_network_diag() {
     AZ_LATENCY_SUMMARY=""
     for az_ip in $az_ips; do
         local az_tcp_time az_pop_name
+        # Use TCP-only connect (http:// not https://) to measure pure network latency without TLS
         az_tcp_time=$(curl -w '%{time_connect}' -o /dev/null -s --max-time 5 \
-            --resolve "github.com:443:$az_ip" https://github.com 2>/dev/null) || az_tcp_time=""
+            --resolve "github.com:80:$az_ip" http://github.com 2>/dev/null) || az_tcp_time=""
         if [ -n "$az_tcp_time" ]; then
             local az_tcp_ms
             az_tcp_ms=$(awk "BEGIN {printf \"%.0f\", $az_tcp_time * 1000}")
@@ -490,9 +494,9 @@ if [ -d "$CLONE_DIR" ]; then
 fi
 if [ $EXIT_CODE -eq 0 ]; then
     log_message "RESULT: SUCCESS (full clone completed before timeout)"
-    log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | SUCCESS | Duration: ${DURATION}s | Size: ${SIZE:-N/A} | Avg: ${SPEED_MBPS:-N/A} MiB/s | $SPEED_STATS | POP: ${GITHUB_POP:-?} | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A}"
+    log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | SUCCESS | Duration: ${DURATION}s | Size: ${SIZE:-N/A} | $SPEED_STATS | POP: ${GITHUB_POP:-?} | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A}"
 elif [ $TIMED_OUT -eq 1 ]; then
-    log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | TIMEOUT | Duration: ${DURATION}s | Size: ${SIZE:-N/A} | Avg: ${SPEED_MBPS:-N/A} MiB/s | $SPEED_STATS | POP: ${GITHUB_POP:-?} | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A}"
+    log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | TIMEOUT | Duration: ${DURATION}s | Size: ${SIZE:-N/A} | $SPEED_STATS | POP: ${GITHUB_POP:-?} | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A}"
 elif [ $TIMED_OUT -eq 0 ]; then
     log_message "RESULT: FAILURE"
     log_message "Exit code: $EXIT_CODE"
