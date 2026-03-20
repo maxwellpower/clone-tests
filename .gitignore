@@ -1,0 +1,10 @@
+.idea
+.vscode
+.DS_Store
+
+# Runtime output - logs, data, and temp files
+*.log
+*.log.old
+clone_speeds.csv
+clone_test.lock
+framework_clone/
