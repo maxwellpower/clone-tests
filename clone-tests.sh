@@ -32,6 +32,7 @@ SPEEDS_LOG="$TEST_DIR/clone_speeds.csv"
 CLONE_LIVE_LOG="$TEST_DIR/clone_live.log"
 NETWORK_LOG="$TEST_DIR/network_diag.log"
 SPEED_STATS_FILE="$TEST_DIR/.clone_speed_stats"
+GITHUB_DEBUG_LOG="$TEST_DIR/github_debug.log"
 CLONE_DIR="$SCRIPT_DIR/git_clone"
 CLONE_TIMEOUT=300  # 5 minutes - linux kernel needs ~2-5 min depending on connection speed
 SLEEP_BETWEEN_RUNS=0   # No delay - start next clone immediately after cancel
@@ -113,6 +114,101 @@ log_message() {
 log_summary() {
     echo "$1" >> "$SUMMARY_LOG"
     echo "$1"
+}
+
+# GitHub Debug diagnostics (mirrors https://github-debug.com/)
+# Runs once per script invocation to capture CDN speeds and verbose git trace
+run_github_debug() {
+    local debug_log="$GITHUB_DEBUG_LOG"
+    local debug_clone_dir="$SCRIPT_DIR/debug-repo"
+
+    echo "# GitHub Debug Diagnostics - $(date '+%Y-%m-%d %H:%M:%S')" > "$debug_log"
+    echo "# Equivalent to https://github-debug.com/ CLI tests" >> "$debug_log"
+    echo "# Run ID: $RUN_ID" >> "$debug_log"
+    echo "" >> "$debug_log"
+
+    log_message "--- GitHub Debug Diagnostics (one-time) ---"
+
+    # 1. CDN endpoint download speed tests
+    log_message "Testing download speed from GitHub CDN endpoints..."
+    echo "=== CDN Download Speed Tests ===" >> "$debug_log"
+    local cdn_endpoints="github.com cloud.githubusercontent.com avatars.githubusercontent.com github.githubassets.com"
+    for endpoint in $cdn_endpoints; do
+        local dl_speed dl_size dl_time
+        dl_out=$(curl -w 'speed:%{speed_download} size:%{size_download} time:%{time_total} dns:%{time_namelookup} tcp:%{time_connect} tls:%{time_appconnect} ttfb:%{time_starttransfer}' \
+            -o /dev/null -s --max-time 15 "https://$endpoint" 2>/dev/null) || dl_out=""
+        if [ -n "$dl_out" ]; then
+            dl_speed=$(echo "$dl_out" | grep -oE 'speed:[0-9.]+' | cut -d: -f2)
+            dl_size=$(echo "$dl_out" | grep -oE 'size:[0-9.]+' | cut -d: -f2)
+            dl_time=$(echo "$dl_out" | grep -oE 'time:[0-9.]+' | cut -d: -f2)
+            dl_dns=$(echo "$dl_out" | grep -oE 'dns:[0-9.]+' | cut -d: -f2)
+            dl_tcp=$(echo "$dl_out" | grep -oE 'tcp:[0-9.]+' | cut -d: -f2)
+            dl_tls=$(echo "$dl_out" | grep -oE 'tls:[0-9.]+' | cut -d: -f2)
+            dl_ttfb=$(echo "$dl_out" | grep -oE 'ttfb:[0-9.]+' | cut -d: -f2)
+            local dl_mbps
+            dl_mbps=$(awk "BEGIN {printf \"%.2f\", ${dl_speed:-0} * 8 / 1024 / 1024}")
+            log_message "  $endpoint: ${dl_mbps} Mbps (${dl_size:-0} bytes in ${dl_time:-?}s)"
+            echo "$endpoint | ${dl_mbps} Mbps | ${dl_size:-0} bytes | time=${dl_time:-?}s dns=${dl_dns:-?}s tcp=${dl_tcp:-?}s tls=${dl_tls:-?}s ttfb=${dl_ttfb:-?}s" >> "$debug_log"
+        else
+            log_message "  $endpoint: failed"
+            echo "$endpoint | FAILED" >> "$debug_log"
+        fi
+    done
+    echo "" >> "$debug_log"
+
+    # 2. Verbose git clone of github/debug-repo (small test repo - protocol-level diagnostics)
+    log_message "Running verbose debug-repo clone (HTTP)..."
+    echo "=== Verbose Debug Repo Clone (HTTPS) ===" >> "$debug_log"
+    rm -rf "$debug_clone_dir"
+    local debug_start debug_end
+    debug_start=$(date +%s)
+    GIT_TRACE=1 GIT_TRANSFER_TRACE=1 GIT_CURL_VERBOSE=1 \
+        git -c http.postBuffer=524288000 clone https://github.com/github/debug-repo "$debug_clone_dir" >> "$debug_log" 2>&1
+    local debug_exit=$?
+    debug_end=$(date +%s)
+    local debug_duration=$((debug_end - debug_start))
+    if [ $debug_exit -eq 0 ]; then
+        log_message "  debug-repo HTTPS clone: OK (${debug_duration}s)"
+    else
+        log_message "  debug-repo HTTPS clone: FAILED (exit $debug_exit, ${debug_duration}s)"
+    fi
+    echo "" >> "$debug_log"
+    echo "Debug repo HTTPS clone: exit=$debug_exit duration=${debug_duration}s" >> "$debug_log"
+    echo "" >> "$debug_log"
+    rm -rf "$debug_clone_dir"
+
+    # 3. SSH clone test (if SSH key is available)
+    echo "=== Verbose Debug Repo Clone (SSH) ===" >> "$debug_log"
+    if ssh -T git@github.com 2>&1 | grep -qi "successfully authenticated\|Hi "; then
+        log_message "Running verbose debug-repo clone (SSH)..."
+        debug_start=$(date +%s)
+        GIT_TRACE=1 GIT_TRANSFER_TRACE=1 GIT_SSH_COMMAND="ssh -v" \
+            git clone git@github.com:github/debug-repo "$debug_clone_dir" >> "$debug_log" 2>&1
+        debug_exit=$?
+        debug_end=$(date +%s)
+        debug_duration=$((debug_end - debug_start))
+        if [ $debug_exit -eq 0 ]; then
+            log_message "  debug-repo SSH clone: OK (${debug_duration}s)"
+        else
+            log_message "  debug-repo SSH clone: FAILED (exit $debug_exit, ${debug_duration}s)"
+        fi
+        echo "" >> "$debug_log"
+        echo "Debug repo SSH clone: exit=$debug_exit duration=${debug_duration}s" >> "$debug_log"
+        rm -rf "$debug_clone_dir"
+    else
+        log_message "  debug-repo SSH clone: skipped (no SSH auth to github.com)"
+        echo "SSH clone: skipped (no SSH auth)" >> "$debug_log"
+    fi
+    echo "" >> "$debug_log"
+
+    # 4. Full curl diagnostic (matches github-debug.com format)
+    echo "=== Full curl diagnostic ===" >> "$debug_log"
+    curl -s -o/dev/null -w "downloadspeed: %{speed_download} | dnslookup: %{time_namelookup} | connect: %{time_connect} | appconnect: %{time_appconnect} | pretransfer: %{time_pretransfer} | starttransfer: %{time_starttransfer} | total: %{time_total} | size: %{size_download}\n" \
+        https://github.com >> "$debug_log" 2>&1
+    echo "" >> "$debug_log"
+
+    log_message "GitHub debug diagnostics saved to: github_debug.log"
+    log_message "--- End GitHub Debug Diagnostics ---"
 }
 
 # Network diagnostics - measure connection quality to GitHub before each clone
@@ -285,6 +381,9 @@ run_network_diag() {
 
     log_message "--- End Network Diagnostics ---"
 }
+
+# Run github-debug.com equivalent diagnostics once at start
+run_github_debug
 
 # Self-scheduling loop - runs continuously, no cron needed
 while true; do

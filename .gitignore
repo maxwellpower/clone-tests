@@ -9,4 +9,5 @@ clone_speeds.csv
 clone_test.lock
 .clone_speed_stats
 git_clone/
+debug-repo/
 logs/
