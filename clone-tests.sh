@@ -20,6 +20,9 @@ while [[ $# -gt 0 ]]; do
 done
 # Configuration - use script's directory for portability across environments
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Version (read from .version file next to this script)
+VERSION="unknown"
+[ -f "$SCRIPT_DIR/.version" ] && VERSION=$(tr -d '[:space:]' < "$SCRIPT_DIR/.version")
 # Default repo: torvalds/linux (~4.5 GB full clone) - large enough for sustained speed measurement
 # Override with --repo <url> for other repos (e.g. --repo https://github.com/chromium/chromium)
 REPO_URL="${CLONE_REPO:-https://github.com/torvalds/linux}"
@@ -33,6 +36,11 @@ CLONE_LIVE_LOG="$TEST_DIR/clone_live.log"
 NETWORK_LOG="$TEST_DIR/network_diag.log"
 SPEED_STATS_FILE="$TEST_DIR/.clone_speed_stats"
 GITHUB_DEBUG_LOG="$TEST_DIR/github_debug.log"
+SYSTEM_INFO_LOG="$TEST_DIR/system_info.log"
+MTR_LOG="$TEST_DIR/mtr.log"
+PING_LOG="$TEST_DIR/ping_continuous.log"
+TCP_STATS_LOG="$TEST_DIR/tcp_stats.log"
+RUN_SUMMARY_JSON="$TEST_DIR/run_summary.json"
 CLONE_DIR="$SCRIPT_DIR/git_clone"
 CLONE_TIMEOUT=300  # 5 minutes - linux kernel needs ~2-5 min depending on connection speed
 SLEEP_BETWEEN_RUNS=0   # No delay - start next clone immediately after cancel
@@ -41,8 +49,9 @@ MAX_LOG_SIZE_KB=51200  # 50 MB - rotate clone_test.log when it exceeds this
 MIN_DISK_FREE_KB=10485760  # 10 GB - skip clone if disk is below this (need ~5 GB for linux kernel)
 mkdir -p "$TEST_DIR"
 echo "============================================"
-echo "Clone Speed Test - Run ID: $RUN_ID"
-echo "Logs: logs/$RUN_ID/"
+echo "Clone Speed Test v${VERSION}"
+echo "Run ID: $RUN_ID"
+echo "Logs:   logs/$RUN_ID/"
 echo "============================================"
 # Prevent multiple instances; clean up orphans from a previous crashed run
 if [ -f "$LOCK_FILE" ]; then
@@ -56,7 +65,7 @@ if [ -f "$LOCK_FILE" ]; then
     fi
 fi
 # Kill any orphaned git clone processes left over from a previous interrupted run
-pkill -f "git clone.*git_clone" 2>/dev/null
+pkill -f "git.*clone.*git_clone" 2>/dev/null
 echo $$ > "$LOCK_FILE"
 
 # Function to kill a process tree (process + all descendants)
@@ -76,6 +85,7 @@ HEARTBEAT_PID=""
 SPEEDS_HEARTBEAT_PID=""
 CLONE_PID=""
 KILLER_PID=""
+PING_BG_PID=""
 
 SHUTTING_DOWN=0
 
@@ -84,12 +94,14 @@ cleanup() {
     kill_tree $SPEEDS_HEARTBEAT_PID 2>/dev/null
     kill_tree $CLONE_PID 2>/dev/null
     kill_tree $KILLER_PID 2>/dev/null
+    kill_tree $PING_BG_PID 2>/dev/null
     # Escalate to SIGKILL for anything that survived
     sleep 1
     kill_tree $HEARTBEAT_PID KILL 2>/dev/null
     kill_tree $SPEEDS_HEARTBEAT_PID KILL 2>/dev/null
     kill_tree $CLONE_PID KILL 2>/dev/null
     kill_tree $KILLER_PID KILL 2>/dev/null
+    kill_tree $PING_BG_PID KILL 2>/dev/null
     wait 2>/dev/null
     rm -f "$LOCK_FILE"
 }
@@ -98,6 +110,7 @@ handle_signal() {
     echo ""
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Caught signal, shutting down..."
     SHUTTING_DOWN=1
+    type finalize_run_summary &>/dev/null && finalize_run_summary 2>/dev/null
     cleanup
     exit 0
 }
@@ -114,6 +127,197 @@ log_message() {
 log_summary() {
     echo "$1" >> "$SUMMARY_LOG"
     echo "$1"
+}
+
+# Capture system/environment fingerprint - runs once per invocation
+# Provides context for support tickets: what machine, OS, network stack, git version
+capture_system_info() {
+    local info_log="$SYSTEM_INFO_LOG"
+    echo "# System Information - $(date '+%Y-%m-%d %H:%M:%S')" > "$info_log"
+    echo "# Run ID: $RUN_ID" >> "$info_log"
+    echo "# Version: $VERSION" >> "$info_log"
+    echo "" >> "$info_log"
+
+    log_message "--- Capturing System Info ---"
+
+    # OS and kernel
+    echo "=== OS ===" >> "$info_log"
+    uname -a >> "$info_log" 2>&1
+    if [[ "$(uname)" == "Darwin" ]]; then
+        sw_vers >> "$info_log" 2>&1
+    elif [ -f /etc/os-release ]; then
+        cat /etc/os-release >> "$info_log" 2>&1
+    fi
+    echo "" >> "$info_log"
+
+    # Network interfaces and IPs
+    echo "=== Network Interfaces ===" >> "$info_log"
+    if [[ "$(uname)" == "Darwin" ]]; then
+        ifconfig 2>/dev/null | grep -E 'flags|inet ' >> "$info_log"
+    else
+        ip -4 addr show 2>/dev/null >> "$info_log" || ifconfig 2>/dev/null | grep -E 'flags|inet ' >> "$info_log"
+    fi
+    echo "" >> "$info_log"
+
+    # Public IP and geolocation (critical for proving where traffic originates)
+    echo "=== Public IP ===" >> "$info_log"
+    PUB_IP=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null)
+    PUB_CITY="" PUB_REGION="" PUB_ORG="" PUB_COUNTRY=""
+    if [ -n "$PUB_IP" ]; then
+        echo "Public IP: $PUB_IP" >> "$info_log"
+        log_message "Public IP: $PUB_IP"
+        # ipinfo.io returns city/region/org - shows ISP and geographic location
+        local pub_geo
+        pub_geo=$(curl -s --max-time 5 "https://ipinfo.io/${PUB_IP}/json" 2>/dev/null)
+        if [ -n "$pub_geo" ]; then
+            echo "$pub_geo" >> "$info_log"
+            PUB_CITY=$(echo "$pub_geo" | grep -oE '"city":\s*"[^"]*"' | cut -d'"' -f4)
+            PUB_REGION=$(echo "$pub_geo" | grep -oE '"region":\s*"[^"]*"' | cut -d'"' -f4)
+            PUB_ORG=$(echo "$pub_geo" | grep -oE '"org":\s*"[^"]*"' | cut -d'"' -f4)
+            PUB_COUNTRY=$(echo "$pub_geo" | grep -oE '"country":\s*"[^"]*"' | cut -d'"' -f4)
+            log_message "Location: $PUB_CITY, $PUB_REGION | ISP: $PUB_ORG"
+        fi
+    else
+        echo "Public IP: unavailable" >> "$info_log"
+    fi
+    echo "" >> "$info_log"
+
+    # Git version
+    echo "=== Git ===" >> "$info_log"
+    git --version >> "$info_log" 2>&1
+    echo "" >> "$info_log"
+
+    # curl version (TLS backend matters for performance)
+    echo "=== curl ===" >> "$info_log"
+    curl --version | head -2 >> "$info_log" 2>&1
+    echo "" >> "$info_log"
+
+    # DNS configuration
+    echo "=== DNS Configuration ===" >> "$info_log"
+    if [[ "$(uname)" == "Darwin" ]]; then
+        scutil --dns >> "$info_log" 2>&1
+    elif [ -f /etc/resolv.conf ]; then
+        cat /etc/resolv.conf >> "$info_log" 2>&1
+    fi
+    echo "" >> "$info_log"
+
+    # Routing table (shows default gateway and any static routes)
+    echo "=== Routing Table ===" >> "$info_log"
+    if [[ "$(uname)" == "Darwin" ]]; then
+        netstat -rn -f inet 2>/dev/null >> "$info_log"
+    else
+        ip route show 2>/dev/null >> "$info_log" || netstat -rn 2>/dev/null >> "$info_log"
+    fi
+    echo "" >> "$info_log"
+
+    # TCP tuning parameters (buffer sizes affect throughput on long-haul paths)
+    echo "=== TCP Tuning ===" >> "$info_log"
+    if [[ "$(uname)" == "Darwin" ]]; then
+        sysctl net.inet.tcp.sendspace net.inet.tcp.recvspace \
+               net.inet.tcp.autorcvbufmax net.inet.tcp.autosndbufmax \
+               net.inet.tcp.rfc1323 net.inet.tcp.mssdflt \
+               net.inet.tcp.win_scale_factor 2>/dev/null >> "$info_log"
+    else
+        sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
+               net.ipv4.tcp_congestion_control net.ipv4.tcp_window_scaling \
+               net.core.rmem_max net.core.wmem_max 2>/dev/null >> "$info_log"
+    fi
+    echo "" >> "$info_log"
+
+    log_message "System info saved to: system_info.log"
+    log_message "--- End System Info ---"
+}
+
+# MTR (My Traceroute) - the single most valuable tool for finding where packet loss occurs
+# Combines traceroute + ping: shows per-hop loss %, jitter, and latency over many probes
+# Run once at startup with enough cycles to catch intermittent loss
+run_mtr() {
+    local mtr_log="$MTR_LOG"
+    log_message "--- Running MTR (per-hop packet loss analysis) ---"
+
+    if command -v mtr &>/dev/null; then
+        echo "# MTR Report - $(date '+%Y-%m-%d %H:%M:%S')" > "$mtr_log"
+        echo "# 100 probes to github.com - look for packet loss at intermediate hops" >> "$mtr_log"
+        echo "# Run ID: $RUN_ID" >> "$mtr_log"
+        echo "" >> "$mtr_log"
+
+        # --report mode: send 100 probes, print summary table with loss % per hop
+        # --report-wide: don't truncate hostnames
+        log_message "Running MTR with 100 probes (this takes ~100 seconds)..."
+        echo "=== MTR to github.com (100 cycles) ===" >> "$mtr_log"
+        mtr --report --report-wide --report-cycles 100 github.com >> "$mtr_log" 2>&1
+        echo "" >> "$mtr_log"
+
+        # Also run MTR to the specific IAD IPs to compare paths
+        for az_ip in 140.82.112.3 140.82.113.3; do
+            local az_rdns
+            az_rdns=$(host "$az_ip" 2>/dev/null | awk '/domain name pointer/ {print $NF}' | head -1)
+            echo "=== MTR to $az_ip (${az_rdns:-IAD}) - 50 cycles ===" >> "$mtr_log"
+            mtr --report --report-wide --report-cycles 50 "$az_ip" >> "$mtr_log" 2>&1
+            echo "" >> "$mtr_log"
+        done
+
+        log_message "MTR complete - saved to mtr.log"
+    else
+        echo "# MTR not installed" > "$mtr_log"
+        echo "# Install with: brew install mtr (macOS) or apt install mtr (Linux)" >> "$mtr_log"
+        log_message "MTR: not installed (brew install mtr) - falling back to extended traceroute"
+
+        # Fallback: multiple traceroutes to detect path instability
+        echo "" >> "$mtr_log"
+        echo "=== Extended Traceroute (3 runs, 30s each) ===" >> "$mtr_log"
+        local trace_cmd=""
+        command -v traceroute &>/dev/null && trace_cmd="traceroute"
+        command -v tracepath &>/dev/null && [ -z "$trace_cmd" ] && trace_cmd="tracepath"
+        if [ -n "$trace_cmd" ]; then
+            local timeout_cmd=""
+            command -v timeout &>/dev/null && timeout_cmd="timeout 30"
+            command -v gtimeout &>/dev/null && [ -z "$timeout_cmd" ] && timeout_cmd="gtimeout 30"
+            [ -z "$timeout_cmd" ] && timeout_cmd="perl -e 'alarm 30; exec @ARGV'"
+            for run in 1 2 3; do
+                echo "--- Traceroute run $run - $(date '+%Y-%m-%d %H:%M:%S') ---" >> "$mtr_log"
+                $timeout_cmd $trace_cmd -m 25 github.com >> "$mtr_log" 2>&1 || true
+                echo "" >> "$mtr_log"
+                sleep 2
+            done
+        fi
+    fi
+}
+
+# Capture TCP connection stats (retransmits, window sizes)
+# High retransmits = packet loss causing TCP to throttle back = speed swings
+capture_tcp_stats() {
+    local label="$1"  # "before" or "after"
+    echo "=== TCP Stats ($label clone #$CLONE_NUM) - $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$TCP_STATS_LOG"
+    if [[ "$(uname)" == "Darwin" ]]; then
+        netstat -s -p tcp 2>/dev/null | grep -iE 'retransmit|timeout|reset|segment|connection|out of order|duplicate' >> "$TCP_STATS_LOG"
+    else
+        netstat -s -t 2>/dev/null | grep -iE 'retransmit|timeout|reset|segment|out of order|loss' >> "$TCP_STATS_LOG"
+        # ss -ti shows per-connection stats but only for active connections
+        ss -ti dst 140.82.112.0/22 2>/dev/null >> "$TCP_STATS_LOG"
+    fi
+    echo "" >> "$TCP_STATS_LOG"
+}
+
+# Start background continuous ping - timestamps every ping for correlation with speed drops
+start_ping_log() {
+    log_message "Starting background ping logger..."
+    (
+        echo "# Continuous Ping - $(date '+%Y-%m-%d %H:%M:%S')" > "$PING_LOG"
+        echo "# Correlate timestamps with speed drops in clone_speeds.csv" >> "$PING_LOG"
+        echo "" >> "$PING_LOG"
+        if [[ "$(uname)" == "Darwin" ]]; then
+            ping -i 1 github.com 2>&1 | while IFS= read -r line; do
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" >> "$PING_LOG"
+            done
+        else
+            ping -i 1 github.com 2>&1 | while IFS= read -r line; do
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" >> "$PING_LOG"
+            done
+        fi
+    ) &
+    PING_BG_PID=$!
+    log_message "Ping logger running (PID $PING_BG_PID)"
 }
 
 # GitHub Debug diagnostics (mirrors https://github-debug.com/)
@@ -229,29 +433,66 @@ run_network_diag() {
     fi
     [ -z "$GITHUB_POP" ] && GITHUB_POP="unknown"
 
-    # DNS resolver analysis - critical for GeoIP routing investigation
-    # GitHub uses Route53/NS1 which route based on the *resolver's* IP, not the client's
-    # If the resolver is in the wrong region, traffic gets sent to the wrong POP
+    # DNS resolver chain analysis - trace the full path that queries take
+    # GitHub uses Route53/NS1 which geo-route based on the resolver's IP, not the client's
     DNS_RESOLVER=""
     DNS_AUTH_NS=""
     DNS_RESOLVER_RDNS=""
+    DNS_CHAIN=""
     if command -v dig &>/dev/null; then
-        # What DNS resolver is this machine using? (the IP that Route53/NS1 sees)
-        DNS_RESOLVER=$(dig +short whoami.akamai.net @ns1-1.akamaitech.net 2>/dev/null | head -1)
-        [ -z "$DNS_RESOLVER" ] && DNS_RESOLVER=$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null | head -1)
-        if [ -n "$DNS_RESOLVER" ]; then
-            DNS_RESOLVER_RDNS=$(host "$DNS_RESOLVER" 2>/dev/null | awk '/domain name pointer/ {print $NF}' | head -1)
-            log_message "DNS resolver outbound IP: $DNS_RESOLVER${DNS_RESOLVER_RDNS:+ ($DNS_RESOLVER_RDNS)}"
+        # 1. What local/system resolver did our query actually go to?
+        local dns_server_used
+        dns_server_used=$(dig github.com 2>/dev/null | awk '/^;; SERVER:/ {split($3, a, "#"); print a[1]}' | head -1)
+        if [ -n "$dns_server_used" ]; then
+            local dns_server_rdns
+            dns_server_rdns=$(host "$dns_server_used" 2>/dev/null | awk '/domain name pointer/ {print $NF}' | head -1)
+            log_message "System DNS server: $dns_server_used${dns_server_rdns:+ ($dns_server_rdns)}"
+            DNS_CHAIN="client->$dns_server_used"
         fi
 
-        # Which DNS server actually answered our query? (local resolver, not auth NS)
-        DNS_SERVER=$(dig github.com 2>/dev/null | awk '/^;; SERVER:/ {gsub(/[^0-9.]/, "", $3); print $3}' | head -1)
-        [ -n "$DNS_SERVER" ] && log_message "DNS server used: $DNS_SERVER"
-        # Which authoritative NS providers serve github.com? (should be Route53 + NS1)
+        # 2. What upstream forwarders does the system resolver use?
+        #    Query through the system resolver to see what IP auth NS receives from
+        local resolver_via_system resolver_via_system_rdns
+        resolver_via_system=$(dig +short whoami.akamai.net @ns1-1.akamaitech.net 2>/dev/null | head -1)
+        if [ -n "$resolver_via_system" ]; then
+            resolver_via_system_rdns=$(host "$resolver_via_system" 2>/dev/null | awk '/domain name pointer/ {print $NF}' | head -1)
+            log_message "Direct auth query source (WAN IP): $resolver_via_system${resolver_via_system_rdns:+ ($resolver_via_system_rdns)}"
+        fi
+
+        # 3. What IP does the system resolver present to authoritative NS?
+        #    Query akamai whoami THROUGH the system resolver (not direct to auth NS)
+        local resolver_seen_by_auth resolver_seen_rdns
+        if [ -n "$dns_server_used" ]; then
+            resolver_seen_by_auth=$(dig +short whoami.akamai.net @"$dns_server_used" 2>/dev/null | head -1)
+        fi
+        if [ -z "$resolver_seen_by_auth" ]; then
+            # Fallback: use default resolver
+            resolver_seen_by_auth=$(dig +short whoami.akamai.net 2>/dev/null | head -1)
+        fi
+        if [ -n "$resolver_seen_by_auth" ]; then
+            resolver_seen_rdns=$(host "$resolver_seen_by_auth" 2>/dev/null | awk '/domain name pointer/ {print $NF}' | head -1)
+            DNS_RESOLVER="$resolver_seen_by_auth"
+            DNS_RESOLVER_RDNS="$resolver_seen_rdns"
+            log_message "Auth NS sees resolver as: $resolver_seen_by_auth${resolver_seen_rdns:+ ($resolver_seen_rdns)}"
+            DNS_CHAIN="${DNS_CHAIN:+$DNS_CHAIN->}$resolver_seen_by_auth->authNS"
+        fi
+
+        # 4. Check EDNS Client Subnet: does Google DNS forward our subnet to auth NS?
+        #    This overrides geo-routing — auth NS uses ECS subnet instead of resolver IP
+        local ecs_info
+        ecs_info=$(dig +short o-o.myaddr.l.google.com TXT @8.8.8.8 2>/dev/null | grep "edns0-client-subnet" | tr -d '"')
+        [ -n "$ecs_info" ] && log_message "Google DNS ECS: $ecs_info"
+
+        # 5. Cloudflare resolver identity — what IP does CF use to query auth NS?
+        local cf_resolver_ip
+        cf_resolver_ip=$(dig +short whoami.cloudflare CH TXT @1.1.1.1 2>/dev/null | tr -d '"')
+        [ -n "$cf_resolver_ip" ] && log_message "Cloudflare resolver IP: $cf_resolver_ip"
+
+        # 6. Which authoritative NS providers serve github.com?
         DNS_AUTH_NS=$(dig NS github.com +short 2>/dev/null | sort | tr '\n' ' ')
         [ -n "$DNS_AUTH_NS" ] && log_message "Auth nameservers: $DNS_AUTH_NS"
 
-        # What do Route53 vs NS1 each return? (they may disagree on POP)
+        # 7. What do Route53 vs NS1 each return for github.com?
         local ns1_ip r53_ip ns1_pop r53_pop
         ns1_ip=$(dig +short github.com @dns1.p08.nsone.net 2>/dev/null | head -1)
         r53_ip=$(dig +short github.com @ns-1707.awsdns-21.co.uk 2>/dev/null | head -1)
@@ -263,10 +504,27 @@ run_network_diag() {
             r53_pop=$(host "$r53_ip" 2>/dev/null | awk '/domain name pointer/ {print $NF}' | head -1 | sed 's/.*-\([a-z][a-z][a-z]\)\..*/\1/' | tr '[:lower:]' '[:upper:]')
             log_message "Route53 returns: $r53_ip (POP: ${r53_pop:-?})"
         fi
-        # Flag if NS1 and Route53 disagree on POP routing
         if [ -n "$ns1_pop" ] && [ -n "$r53_pop" ] && [ "$ns1_pop" != "$r53_pop" ]; then
             log_message "WARNING: NS1 ($ns1_pop) and Route53 ($r53_pop) disagree on POP!"
         fi
+
+        # 8. Compare: what does the system resolver return vs direct public DNS?
+        local system_github_ip google_github_ip cf_github_ip sys_pop google_pop cf_pop
+        system_github_ip=$(dig +short github.com 2>/dev/null | head -1)
+        google_github_ip=$(dig +short github.com @8.8.8.8 2>/dev/null | head -1)
+        cf_github_ip=$(dig +short github.com @1.1.1.1 2>/dev/null | head -1)
+        if [ -n "$system_github_ip" ]; then
+            sys_pop=$(host "$system_github_ip" 2>/dev/null | awk '/domain name pointer/ {print $NF}' | head -1 | sed 's/.*-\([a-z][a-z][a-z]\)\..*/\1/' | tr '[:lower:]' '[:upper:]')
+        fi
+        if [ -n "$google_github_ip" ]; then
+            google_pop=$(host "$google_github_ip" 2>/dev/null | awk '/domain name pointer/ {print $NF}' | head -1 | sed 's/.*-\([a-z][a-z][a-z]\)\..*/\1/' | tr '[:lower:]' '[:upper:]')
+        fi
+        if [ -n "$cf_github_ip" ]; then
+            cf_pop=$(host "$cf_github_ip" 2>/dev/null | awk '/domain name pointer/ {print $NF}' | head -1 | sed 's/.*-\([a-z][a-z][a-z]\)\..*/\1/' | tr '[:lower:]' '[:upper:]')
+        fi
+        log_message "POP by resolver: System=${sys_pop:-?}($system_github_ip) Google=${google_pop:-?}($google_github_ip) CF=${cf_pop:-?}($cf_github_ip)"
+
+        [ -n "$DNS_CHAIN" ] && log_message "DNS chain: $DNS_CHAIN"
     else
         log_message "DNS resolver analysis: dig not available"
     fi
@@ -348,7 +606,7 @@ run_network_diag() {
     fi
 
     # Append to network diagnostics log
-    echo "Clone #$CLONE_NUM | $(date '+%Y-%m-%d %H:%M:%S') | IP=$GITHUB_IP | POP=$GITHUB_POP | Resolver=${DNS_RESOLVER:-N/A} | AuthNS=${DNS_AUTH_NS:-N/A} | AZ_Latency: ${AZ_LATENCY_SUMMARY:-N/A}| $DIAG_SUMMARY | Ping=${PING_AVG:-N/A}ms Loss=${PING_LOSS:-N/A} | rDNS=${GITHUB_RDNS:-N/A}" >> "$NETWORK_LOG"
+    echo "Clone #$CLONE_NUM | $(date '+%Y-%m-%d %H:%M:%S') | IP=$GITHUB_IP | POP=$GITHUB_POP | Resolver=${DNS_RESOLVER:-N/A} | AuthNS=${DNS_AUTH_NS:-N/A} | DNSChain=${DNS_CHAIN:-N/A} | AZ_Latency: ${AZ_LATENCY_SUMMARY:-N/A}| $DIAG_SUMMARY | Ping=${PING_AVG:-N/A}ms Loss=${PING_LOSS:-N/A} | rDNS=${GITHUB_RDNS:-N/A}" >> "$NETWORK_LOG"
 
     # Traceroute - capture the path to github.com (key evidence for routing issues)
     log_message "Running traceroute to github.com (15s max)..."
@@ -382,8 +640,104 @@ run_network_diag() {
     log_message "--- End Network Diagnostics ---"
 }
 
-# Run github-debug.com equivalent diagnostics once at start
+# Run one-time diagnostics at start of run
+capture_system_info
 run_github_debug
+run_mtr
+start_ping_log
+
+# Extract worst MTR hop for summary (highest loss at an intermediate hop)
+MTR_WORST_HOP="" MTR_WORST_LOSS="" MTR_WORST_HOST=""
+if [ -f "$MTR_LOG" ] && grep -q "Loss%" "$MTR_LOG"; then
+    # Parse MTR report: find intermediate hop with highest loss (skip first/last hop and ???)
+    read -r MTR_WORST_HOST MTR_WORST_LOSS <<< $(awk '
+        /^\s*[0-9]+\.\|--/ && !/\?\?\?/ {
+            gsub(/\|--/, "")
+            hop=$1+0; host=$2; loss=$3
+            gsub(/%/, "", loss)
+            if (loss+0 > max_loss+0 && loss+0 < 100) { max_loss=loss; max_host=host; max_hop=hop }
+        }
+        END { if (max_hop) printf "%s %s", max_host, max_loss }
+    ' "$MTR_LOG")
+fi
+
+# Write initial run_summary.json with system info
+# Escape strings for safe JSON embedding (handles quotes, backslashes, newlines)
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+RUN_SUMMARY_FINALIZED=0
+write_run_summary() {
+    cat > "$RUN_SUMMARY_JSON" << SUMMARY_EOF
+{
+  "run_id": "$RUN_ID",
+  "version": "$VERSION",
+  "timestamp": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+  "env": "$(json_escape "${CLONE_ENV:-}")",
+  "repo": "$(json_escape "$REPO_URL")",
+  "system": {
+    "os": "$(json_escape "$(uname -s) $(uname -r)")",
+    "hostname": "$(json_escape "$(hostname -s 2>/dev/null || echo unknown)")",
+    "public_ip": "$(json_escape "${PUB_IP:-unknown}")",
+    "city": "$(json_escape "${PUB_CITY:-unknown}")",
+    "region": "$(json_escape "${PUB_REGION:-unknown}")",
+    "country": "$(json_escape "${PUB_COUNTRY:-unknown}")",
+    "isp": "$(json_escape "${PUB_ORG:-unknown}")",
+    "git_version": "$(git --version 2>/dev/null | awk '{print $3}')",
+    "curl_version": "$(curl --version 2>/dev/null | head -1 | awk '{print $2}')"
+  },
+  "mtr": {
+    "worst_hop_host": "$(json_escape "${MTR_WORST_HOST:-none}")",
+    "worst_hop_loss_pct": ${MTR_WORST_LOSS:-0},
+    "has_mtr": $(command -v mtr &>/dev/null && echo "true" || echo "false")
+  },
+  "clones": [
+SUMMARY_EOF
+}
+
+# Append a clone result to run_summary.json
+append_clone_summary() {
+    local result="$1" comma=""
+    # Add comma before all entries except the first
+    [ "$CLONE_NUM" -gt 1 ] && comma=","
+    cat >> "$RUN_SUMMARY_JSON" << CLONE_EOF
+    ${comma}{
+      "clone_num": $CLONE_NUM,
+      "timestamp": "$(json_escape "$START_TIMESTAMP")",
+      "result": "$result",
+      "duration_s": $DURATION,
+      "speed_min_mib": ${SPEED_MIN:-0},
+      "speed_max_mib": ${SPEED_MAX:-0},
+      "speed_avg_mib": ${SPEED_AVG:-0},
+      "speed_samples": ${SPEED_SAMPLES:-0},
+      "pop": "$(json_escape "${GITHUB_POP:-unknown}")",
+      "github_ip": "$GITHUB_IP",
+      "dns_resolver_ip": "$(json_escape "${DNS_RESOLVER:-unknown}")",
+      "ping_avg_ms": "${PING_AVG:-0}",
+      "ping_loss": "${PING_LOSS:-0%}",
+      "https_dns_ms": "${DIAG_DNS_MS:-0}",
+      "https_tcp_ms": "${DIAG_TCP_MS:-0}",
+      "https_tls_ms": "${DIAG_TLS_MS:-0}",
+      "https_ttfb_ms": "${DIAG_TTFB_MS:-0}"
+    }
+CLONE_EOF
+}
+
+# Close the JSON array (called on shutdown, idempotent)
+finalize_run_summary() {
+    if [ "$RUN_SUMMARY_FINALIZED" -eq 0 ] && [ -f "$RUN_SUMMARY_JSON" ]; then
+        RUN_SUMMARY_FINALIZED=1
+        echo "  ]" >> "$RUN_SUMMARY_JSON"
+        echo "}" >> "$RUN_SUMMARY_JSON"
+    fi
+}
+write_run_summary
 
 # Self-scheduling loop - runs continuously, no cron needed
 while true; do
@@ -413,6 +767,12 @@ SPEEDS_HEARTBEAT_PID=""
 CLONE_PID=""
 KILLER_PID=""
 DIAG_SUMMARY=""
+DIAG_DNS_MS=""
+DIAG_TCP_MS=""
+DIAG_TLS_MS=""
+DIAG_TTFB_MS=""
+DNS_RESOLVER=""
+DNS_CHAIN=""
 PING_AVG=""
 PING_LOSS=""
 GITHUB_RDNS=""
@@ -447,6 +807,9 @@ fi
 # Run network diagnostics before clone
 run_network_diag
 
+# Capture TCP stats before clone (delta shows retransmits during clone)
+capture_tcp_stats "before"
+
 # Record start time
 START_TIME=$(date +%s)
 START_TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
@@ -475,23 +838,20 @@ HEARTBEAT_PID=$!
     echo "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $(date '+%Y-%m-%d %H:%M:%S') | (stalled - no update 60s) | -- | ${GITHUB_POP:-?} | $GITHUB_IP" >> "$SPEEDS_LOG"
   done ) &
 SPEEDS_HEARTBEAT_PID=$!
-# Use PTY so git outputs progress (git buffers when piped). script writes typescript to file - use /dev/stdout to capture
+# Use PTY so git outputs progress (git buffers when piped). script writes typescript to /dev/stdout
 run_git() {
-    # Large repos need bigger POST buffer to avoid HTTP 400 on ref negotiation
     if command -v stdbuf &>/dev/null; then
-        stdbuf -oL git -c http.postBuffer=524288000 clone --progress "$REPO_URL" "$CLONE_DIR" 2>&1
+        stdbuf -oL git -c http.postBuffer=524288000 clone --bare --progress "$REPO_URL" "$CLONE_DIR" 2>&1
     elif command -v script &>/dev/null; then
         if [[ "$(uname)" == "Darwin" ]]; then
-            script -q /dev/stdout git -c http.postBuffer=524288000 clone --progress "$REPO_URL" "$CLONE_DIR" 2>&1
+            script -q /dev/stdout git -c http.postBuffer=524288000 clone --bare --progress "$REPO_URL" "$CLONE_DIR" 2>&1
         else
-            script -q -F -t 0 /dev/stdout git -c http.postBuffer=524288000 clone --progress "$REPO_URL" "$CLONE_DIR" 2>&1
+            script -q -F -t 0 /dev/stdout git -c http.postBuffer=524288000 clone --bare --progress "$REPO_URL" "$CLONE_DIR" 2>&1
         fi
     else
-        git -c http.postBuffer=524288000 clone --progress "$REPO_URL" "$CLONE_DIR" 2>&1
+        git -c http.postBuffer=524288000 clone --bare --progress "$REPO_URL" "$CLONE_DIR" 2>&1
     fi
 }
-# tr '\r' '\n' - git uses \r for progress overwrites; without this, read blocks until clone finishes
-# Unbuffered \r-to-\n conversion (stdbuf on Linux, perl sysread on macOS)
 unbuf_tr() {
     if command -v stdbuf &>/dev/null; then
         stdbuf -oL tr '\r' '\n'
@@ -502,37 +862,30 @@ unbuf_tr() {
 
 ( run_git | unbuf_tr | while IFS= read -r line; do
     [ -z "$line" ] && continue
-    # Stop heartbeat once git starts producing output
     kill $HEARTBEAT_PID 2>/dev/null
     msg="[$(date '+%Y-%m-%d %H:%M:%S')] GIT: $line"
     echo "$msg" >> "$LOG_FILE"
     echo "$msg"
-    # Live log: append every line immediately for tail -f (updates as git outputs, not just speed samples)
     echo "$msg" >> "$CLONE_LIVE_LOG"
-    # Extract speed samples - git uses MiB/s when fast, KiB/s when slow (e.g. "157.21 MiB | 4.58 MiB/s" or "13.30 MiB | 774.00 KiB/s")
     if [[ "$line" =~ ([0-9]+\.[0-9]+)\ (MiB|GiB)\ \|\ ([0-9]+\.[0-9]+)\ (MiB|KiB)/s ]]; then
         received_val="${BASH_REMATCH[1]}"
         received_unit="${BASH_REMATCH[2]}"
         speed_val="${BASH_REMATCH[3]}"
         speed_unit="${BASH_REMATCH[4]}"
-        # Normalize received to MiB for monotonic check (detect macOS script buffer replays)
         if [[ "$received_unit" == "GiB" ]]; then
             received_mib=$(awk "BEGIN {printf \"%.2f\", $received_val * 1024}")
         else
             received_mib="$received_val"
         fi
-        # Skip if received went backward (macOS script replays entire buffer at end)
         if [[ -n "$LAST_RECEIVED_MIB" ]]; then
             is_backward=$(awk "BEGIN {print ($received_mib < $LAST_RECEIVED_MIB) ? 1 : 0}")
             [[ "$is_backward" == "1" ]] && continue
         fi
-        # Skip consecutive identical values
         current="${received_val}|${speed_val}|${speed_unit}"
         [[ "$current" == "${LAST_SPEED:-}" ]] && continue
         LAST_SPEED="$current"
         LAST_RECEIVED_MIB="$received_mib"
         ts=$(date '+%Y-%m-%d %H:%M:%S')
-        # Normalize to MiB/s for consistent CSV (KiB/s / 1024 = MiB/s)
         if [[ "$speed_unit" == "KiB" ]]; then
             speed_mib=$(awk "BEGIN {printf \"%.2f\", $speed_val / 1024}")
         else
@@ -542,29 +895,28 @@ unbuf_tr() {
         line_out="Clone #$CLONE_NUM | ${CLONE_ENV:--} | $ts | ${received_val} ${received_unit} received | $speed_display | ${GITHUB_POP:-?} | $GITHUB_IP"
         echo "$line_out" >> "$SPEEDS_LOG"
         echo "$line_out"
-        # Track min/max/sum/count for per-clone speed stats
         echo "$speed_mib" >> "$SPEED_STATS_FILE"
     fi
 done ) &
 CLONE_PID=$!
-# Kill the entire process tree (git + pipe + while loop) after timeout
-( sleep $CLONE_TIMEOUT
-  kill_tree $CLONE_PID
-  sleep 2
-  kill_tree $CLONE_PID KILL
-) &
+# Kill the entire process tree after timeout
+( sleep $CLONE_TIMEOUT && kill_tree $CLONE_PID && sleep 2 && kill_tree $CLONE_PID KILL ) 2>/dev/null &
 KILLER_PID=$!
 wait $CLONE_PID 2>/dev/null
 EXIT_CODE=$?
 kill_tree $HEARTBEAT_PID 2>/dev/null
 kill_tree $SPEEDS_HEARTBEAT_PID 2>/dev/null
 kill_tree $KILLER_PID 2>/dev/null
-wait 2>/dev/null
+# Only wait for specific PIDs - bare 'wait' would block on PING_BG_PID (runs forever)
+wait $CLONE_PID $KILLER_PID 2>/dev/null
 END_TIME=$(date +%s)
 END_TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 DURATION=$((END_TIME - START_TIME))
 log_message "Clone ended at: $END_TIMESTAMP"
 log_message "Duration: ${DURATION} seconds"
+
+# Capture TCP stats after clone (compare with before to find retransmits)
+capture_tcp_stats "after"
 
 # Calculate per-clone speed stats from samples (min/max/avg)
 SPEED_MIN="" SPEED_MAX="" SPEED_AVG="" SPEED_SAMPLES=0
@@ -600,9 +952,11 @@ if [ -d "$CLONE_DIR" ]; then
 fi
 if [ $TIMED_OUT -eq 1 ]; then
     log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | TIMEOUT | Duration: ${DURATION}s | Size: ${SIZE:-N/A} | $SPEED_STATS | POP: ${GITHUB_POP:-?} | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A}"
+    append_clone_summary "TIMEOUT"
 elif [ $EXIT_CODE -eq 0 ]; then
     log_message "RESULT: SUCCESS (full clone completed before timeout)"
     log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | SUCCESS | Duration: ${DURATION}s | Size: ${SIZE:-N/A} | $SPEED_STATS | POP: ${GITHUB_POP:-?} | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A}"
+    append_clone_summary "SUCCESS"
 else
     log_message "RESULT: FAILURE"
     log_message "Exit code: $EXIT_CODE"
@@ -610,6 +964,7 @@ else
     log_message "Error summary from git output:"
     grep -i "error\|fatal\|timeout\|connection\|denied" "$LOG_FILE" | tail -10 | tee -a "$LOG_FILE"
     log_summary "Clone #$CLONE_NUM | ${CLONE_ENV:--} | $START_TIMESTAMP | FAILURE | Duration: ${DURATION}s | Exit Code: $EXIT_CODE | POP: ${GITHUB_POP:-?} | IP: $GITHUB_IP | Net: ${DIAG_SUMMARY:-N/A} | Ping: ${PING_AVG:-N/A}ms Loss: ${PING_LOSS:-N/A} | Error: $ERROR_MSG"
+    append_clone_summary "FAILURE"
 fi
 # ALWAYS cleanup clone directory to save space
 if [ -d "$CLONE_DIR" ]; then
